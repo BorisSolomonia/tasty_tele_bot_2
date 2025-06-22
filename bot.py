@@ -88,7 +88,8 @@ def call_gpt_for_parsing(text):
     Customer name is always in the beginning of the text.
     Customer names: {', '.join(KNOWN_CUSTOMERS)}.
     Product names: {', '.join(KNOWN_PRODUCTS)}.
-    Return JSON like: {{"type": "order", "customer": "ჟღენტი", "product": "პერედინა", "amount": "30კგ", "comment": ""}}
+    Return JSON like: {{"type": "order", "customer": "ჟღენტი", "product": "პერედინა", "amount": "30კგ", "comment": ""}} (WITHOUT triple backticks)
+    IMPORTANT: Do NOT wrap the output in triple backticks or markdown.
     """
 
     try:
@@ -101,12 +102,20 @@ def call_gpt_for_parsing(text):
         )
         content = response.choices[0].message.content.strip()
         logging.info(f"GPT returned: {content}")
+
+        # Remove Markdown code fences if present
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\n", "", content)
+            content = re.sub(r"\n```$", "", content)
+
         parsed = json.loads(content)
-        parsed["type"] = "order"  # Ensure "type" is set, even if GPT forgets
+        parsed["type"] = "order"
         return parsed
+
     except Exception as e:
         logging.error(f"GPT parsing failed: {e}")
         return None
+
 
 
 def update_google_sheet(data, author):
