@@ -84,21 +84,26 @@ def extract_data_from_line(line):
 def call_gpt_for_parsing(text):
     prompt = f"""
     The following text is a Georgian order message. Extract and return the customer name, product name, quantity, and optional comment.
-    Text: "{text}"
-    Return JSON like: {{"type": "order", "customer": "ჟღენტი", "product": "პერედინა", "amount": "30კგ", "comment": ""}}
+    Text: "{text}".
+    customer name is always in the beginning of the text.
+    customer names are: {', '.join(KNOWN_CUSTOMERS)}.
+    product names are: {', '.join(KNOWN_PRODUCTS)}.
+    Return JSON like: {{"customer": "ჟღენტი", "product": "პერედინა", "amount": "30კგ", "comment": ""}}
     """
 
+    response = openai.chat.completions.create(  # ← for openai>=1.0.0
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that extracts structured Georgian order data."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
     try:
-        response = client_ai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts structured Georgian order data."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2
-        )
-        raw = response.choices[0].message.content
-        return json.loads(raw)
+        content = response.choices[0].message.content.strip()
+        logging.info(f"GPT returned: {content}")
+        parsed = json.loads(content)
+        return parsed
     except Exception as e:
         logging.error(f"GPT parsing failed: {e}")
         return None
