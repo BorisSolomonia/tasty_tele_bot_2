@@ -8,6 +8,7 @@ from rapidfuzz import process
 import openai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import asyncio
 
 # --- SETUP ---
 
@@ -125,11 +126,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- MAIN ---
 
-def main():
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
