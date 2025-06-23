@@ -67,55 +67,19 @@ def extract_data_from_line(line):
         return None
 
     customer_raw, product_raw, number, unit, comment = match.groups()
-    customer = fuzzy_match(customer_raw, KNOWN_CUSTOMERS) or customer_raw
-    product = fuzzy_match(product_raw, KNOWN_PRODUCTS) or product_raw
-    amount_value = number
-    amount_unit = unit or ""
+    matched_customer = fuzzy_match(customer_raw, KNOWN_CUSTOMERS)
+    matched_product = fuzzy_match(product_raw, KNOWN_PRODUCTS)
 
     return {
         "type": "order",
-        "customer": customer,
-        "product": product,
-        "amount_value": amount_value,
-        "amount_unit": amount_unit,
+        "customer": matched_customer or customer_raw,
+        "product": matched_product or product_raw,
+        "amount_value": number,
+        "amount_unit": unit or "",
         "comment": comment or "",
         "raw_customer": customer_raw,
         "raw_product": product_raw
     }
-
-def call_gpt_for_parsing(text):
-    prompt = f"""
-    The following text is a Georgian order message. Extract and return the customer name, product name, quantity, and optional comment.
-    Text: "{text}".
-    Customer name is always in the beginning of the text.
-    Customer names: {', '.join(KNOWN_CUSTOMERS)}.
-    Product names: {', '.join(KNOWN_PRODUCTS)}.
-    Return JSON like: {{"type": "order", "customer": "ჟღენტი", "product": "პერედინა", "amount_value": "30", "amount_unit": "კგ", "comment": ""}}
-    IMPORTANT: Do NOT wrap the output in triple backticks or markdown.
-    """
-
-    try:
-        response = client_ai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts structured Georgian order data."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        content = response.choices[0].message.content.strip()
-        logging.info(f"GPT returned: {content}")
-
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?\n", "", content)
-            content = re.sub(r"\n```$", "", content)
-
-        parsed = json.loads(content)
-        parsed["type"] = "order"
-        return parsed
-
-    except Exception as e:
-        logging.error(f"GPT parsing failed: {e}")
-        return None
 
 def update_google_sheet(data, author):
     if data['type'] == 'order':
@@ -152,7 +116,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         warn += " ⚠ უცნობი მომხმარებელი"
                     if data['product'] == data['raw_product']:
                         warn += " ⚠ უცნობი პროდუქტი"
-                    await update.message.reply_text(f"✅ Logged: {data['customer']} / {data['product']} / {data['amount_value']}{data['amount_unit']}{warn}")
+                    await update.message.reply_text(
+                        f"✅ Logged: {data['customer']} / {data['product']} / {data['amount_value']}{data['amount_unit']}{warn}"
+                    )
                 else:
                     await update.message.reply_text(f"❌ Couldn't parse: {subline}")
 
