@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from rapidfuzz import process
+from rapidfuzz import process, fuzz
 from openai import OpenAI
 from dotenv import load_dotenv
 import gspread
@@ -27,8 +27,7 @@ SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Load known lists from files ---
-
+# Load known lists
 def load_list_from_file(filename):
     try:
         with open(filename, encoding='utf-8') as f:
@@ -40,123 +39,117 @@ def load_list_from_file(filename):
 KNOWN_CUSTOMERS = load_list_from_file("known_customers.txt")
 KNOWN_PRODUCTS = load_list_from_file("known_products.txt")
 
-# --- Google Sheets Setup ---
-
+# Google Sheets Setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
 sheet = gspread.authorize(creds).open(SPREADSHEET_NAME).sheet1
 
 # --- UTILS ---
 
-def fuzzy_customer_candidates(input_customer, known_list, threshold=50, top_n=5):
-    matches = process.extract(input_customer, known_list, limit=top_n)
-    shortlist = [match for match, score, _ in matches if score >= threshold]
-    logging.info(f"Shortlist for '{input_customer}': {shortlist}")
-    return shortlist
+def fuzzy_match_all(term, known_list, threshold=50):
+    results = process.extract(term, known_list, scorer=fuzz.ratio)
+    return [item for item, score, _ in results if score >= threshold]
 
-def sanitize(value):
-    return str(value).strip().replace('\n', ' ').replace('\r', '').replace('\t', '')
+def split_customer_and_products(text):
+    if '.' not in text:
+        return text, []
+    customer_raw, rest = text.split('.', 1)
+    product_lines = re.split(r'[;,]', rest)
+    return customer_raw.strip(), [p.strip() for p in product_lines if p.strip()]
 
-def update_google_sheet_row(data, author):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sheet.append_row([
-        sanitize(timestamp),
-        sanitize(data['customer']),
-        sanitize(data['product']),
-        sanitize(data['amount_value']),
-        sanitize(data['amount_unit']),
-        sanitize(data['comment']),
-        sanitize(author)
-    ], value_input_option='USER_ENTERED')
+def call_openai_parse(customer_raw, customer_options, product_lines):
+    customer_str = ", ".join(customer_options)
+    product_str = ", ".join(KNOWN_PRODUCTS)
+    items = "\n".join(product_lines)
+    prompt = f"""
+Given the following order message:
 
-def call_openai_parser(message, customer_input):
-    shortlist = fuzzy_customer_candidates(customer_input, KNOWN_CUSTOMERS)
+Customer guess: "{customer_raw}"
+Possible matching customers: {customer_str}
 
-    system_prompt = f"""
-        You are a strict parser. Return ONLY valid JSON. No markdown, no explanation.
-        Match the customer to this shortlist: {', '.join(shortlist)}
-        Match products to this list: {', '.join(KNOWN_PRODUCTS)}
+Product message lines:
+{items}
 
-        The user will send you a message like:
-        "ფუდსელი. 20კგ ხორცი, 5ც გრუდინკა"
+Known product list: {product_str}
 
-        Your job is to extract structured product orders.
-        Return a JSON array like this (for multiple products):
+For each line, extract:
+- product (match from list if possible)
+- amount (number)
+- unit (კგ, ც, ლ, გრამი)
+- comment (if any)
 
-        [
-        {{
-            "customer": "შპს ფუდსელი",
-            "product": "ხორცი",
-            "amount_value": "20",
-            "amount_unit": "კგ",
-            "comment": ""
-        }},
-        {{
-            "customer": "შპს ფუდსელი",
-            "product": "გრუდინკა",
-            "amount_value": "5",
-            "amount_unit": "ც",
-            "comment": ""
-        }}
-        ]
-
-        Now parse the user message strictly and return valid JSON array only.
-        """
+Respond in JSON array format like:
+[
+  {{
+    "customer": "matched customer",
+    "product": "matched product or raw",
+    "amount_value": "10",
+    "amount_unit": "კგ",
+    "comment": "optional"
+  }},
+  ...
+]
+"""
 
     try:
         response = client_ai.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
+                {"role": "system", "content": "You extract structured order info from Georgian messages using customer and product lists."},
+                {"role": "user", "content": prompt}
             ]
         )
         content = response.choices[0].message.content.strip()
-
-        # Log raw content for debugging
-        logging.info(f"OpenAI raw response:\n{content}")
-
-        # Attempt to extract JSON block using regex if needed
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-
-        return json.loads(content)
-
+        parsed = json.loads(content)
+        for entry in parsed:
+            entry["type"] = "order"
+            entry["raw_customer"] = customer_raw
+            entry["customer_unknown"] = entry["customer"] not in KNOWN_CUSTOMERS
+            entry["product_unknown"] = entry["product"] not in KNOWN_PRODUCTS
+        return parsed
     except Exception as e:
         logging.error(f"OpenAI parsing failed: {e}")
-        return None
+        return []
 
+def update_google_sheet(data, author):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet.append_row([
+        timestamp,
+        data['customer'],
+        data['product'],
+        data['amount_value'],
+        data['amount_unit'],
+        data.get('comment', ''),
+        author
+    ], value_input_option='USER_ENTERED')
 
-# --- TELEGRAM HANDLERS ---
+# --- TELEGRAM ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Send me an order and I’ll log it to Google Sheets.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message.text
+    text = update.message.text.strip()
     author = update.message.from_user.full_name or update.message.from_user.username or str(update.message.from_user.id)
 
-    # Extract customer before first dot
-    parts = re.split(r'\s*\.\s*', message, maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("❌ Message must start with customer name followed by '.'")
+    customer_raw, product_lines = split_customer_and_products(text)
+    matched_customers = fuzzy_match_all(customer_raw, KNOWN_CUSTOMERS, threshold=50)
+    parsed_items = call_openai_parse(customer_raw, matched_customers, product_lines)
+
+    if not parsed_items:
+        await update.message.reply_text("❌ ვერ დავამუშავე შეტყობინება.")
         return
 
-    customer_guess = parts[0]
-
-    structured_data = call_openai_parser(message, customer_guess)
-
-    if not structured_data:
-        await update.message.reply_text("❌ GPT parsing failed.")
-        return
-
-    replies = []
-    for item in structured_data:
-        update_google_sheet_row(item, author)
-        replies.append(f"✅ {item['customer']} / {item['product']} / {item['amount_value']}{item['amount_unit']}")
-
-    await update.message.reply_text('\n'.join(replies))
+    for data in parsed_items:
+        update_google_sheet(data, author)
+        warn = ""
+        if data["customer_unknown"]:
+            warn += " ⚠ უცნობი მომხმარებელი"
+        if data["product_unknown"]:
+            warn += " ⚠ უცნობი პროდუქტი"
+        await update.message.reply_text(
+            f"✅ Logged: {data['customer']} / {data['product']} / {data['amount_value']}{data['amount_unit']}{warn}"
+        )
 
 # --- MAIN ---
 
