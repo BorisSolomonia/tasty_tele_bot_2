@@ -23,32 +23,24 @@ logging.basicConfig(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDENTIALS_FILE = "google-credentials.json"
-SPREADSHEET_NAME = "Preseller Orders"
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# Known lists
-KNOWN_PRODUCTS = [
-    "ბადექონი", "ღორის ხორცი (ფერდი)", "ღორის ხორცი (კისერი)", "საქონლის ფარში",
-    "ღორის ხორცი", "საქონლის ხორცი (ძვლიანი)", "საქონლის ხორცი", "ღორის ხორცი",
-    "საქონლის ხორცი (რბილი)", "ხბოს ხორცი", "ღორის კანჭი", "გრუდინკა",
-    "ღორის ხორცი (რბილი)", "ხორცი", "ნეკნი", "საქონლის ცხიმი", "საქონლის ხორცი (სუკი)",
-    "პერედინკა", "ღორის ქონი", "არტალა (რბილი)"
-]
+# --- Load known lists from files ---
 
-KNOWN_CUSTOMERS = [
-    "შპს წისქვილი ჯგუფი", "შპს აურა", "ელგუჯა ციბაძე", "შპს მესი 2022", "შპს სიმბა 2015",
-    "შპს სქულფუდ", "ირინე ხუნდაძე", "შპს მაგსი", "შპს ასი-100", "შპს ვარაზის ხევი 95",
-    "შპს  ხინკლის ფაბრიკა", "შპს სამიკიტნო-მაჭახელა", "შპს რესტორან მენეჯმენტ კომპანი",
-    "შპს თაღლაურა  მენეჯმენტ კომპანი", "შპს  ნარნია", "შპს ბუკა202", "შპს მუჭა მუჭა 2024",
-    "შპს აკიდო 2023", "შპს MASURO", "შპს MSR", "ნინო მუშკუდიანი", "შპს ქალაქი 27",
-    "შპს 'სპრინგი' -რესტორანი ბეღელი", "შპს ნეკაფე", "შპს თეისთი", "შპს იმფერი",
-    "შპს შნო მოლი", "შპს რესტორან ჯგუფი", "შპს ხინკა", "მერაბი ბერიშვილი",
-    "შპს სანაპირო 2022", "შპს ქეი-ბუ", "შპს ბიგ სემი", "შპს კატოსან",
-    "შპს  ბრაუჰაუს ტიფლისი", "შპს ბუდვაიზერი - სამსონი", "შპს სსტ ჯეორჯია",
-    "შპს ვახტანგური", "შპს ფუდსელი", "შპს მღვიმე", "შპს ათუ", "შპს გრინ თაუერი",
-    "შპს გურმე", "შპს ქვევრი 2019", "ლევან ადამია", "გურანდა ლაღაძე"
-]
+def load_list_from_file(filename):
+    try:
+        with open(filename, encoding='utf-8') as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        logging.error(f"File not found: {filename}")
+        return []
+
+KNOWN_CUSTOMERS = load_list_from_file("known_customers.txt")
+KNOWN_PRODUCTS = load_list_from_file("known_products.txt")
+
+# --- Google Sheets Setup ---
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
@@ -56,71 +48,98 @@ sheet = gspread.authorize(creds).open(SPREADSHEET_NAME).sheet1
 
 # --- UTILS ---
 
-def fuzzy_match(term, known_list, threshold=80):
-    match, score, _ = process.extractOne(term, known_list)
-    return match if score >= threshold else None
+def fuzzy_customer_candidates(input_customer, known_list, threshold=50, top_n=5):
+    matches = process.extract(input_customer, known_list, limit=top_n)
+    shortlist = [match for match, score, _ in matches if score >= threshold]
+    logging.info(f"Shortlist for '{input_customer}': {shortlist}")
+    return shortlist
 
-def extract_data_from_line(line):
-    line = line.strip()
-    match = re.match(r"(.+?)\s*\.\s*(.+?)\s+(\d+)(კგ|ც)?\s*(.*)?", line)
-    if not match:
+def sanitize(value):
+    return str(value).strip().replace('\n', ' ').replace('\r', '').replace('\t', '')
+
+def update_google_sheet_row(data, author):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet.append_row([
+        sanitize(timestamp),
+        sanitize(data['customer']),
+        sanitize(data['product']),
+        sanitize(data['amount_value']),
+        sanitize(data['amount_unit']),
+        sanitize(data['comment']),
+        sanitize(author)
+    ], value_input_option='USER_ENTERED')
+
+def call_openai_parser(message, customer_input):
+    shortlist = fuzzy_customer_candidates(customer_input, KNOWN_CUSTOMERS)
+
+    system_prompt = f"""
+You are a helpful assistant that extracts structured order data from Georgian Telegram messages.
+Use this customer shortlist for matching: {', '.join(shortlist)}.
+Known product list: {', '.join(KNOWN_PRODUCTS)}.
+
+Message may contain multiple products for the same customer. For each product, extract:
+- customer (one from shortlist or fallback to raw)
+- product (closest match from list or fallback)
+- amount value
+- amount unit (კგ, ც, ლ, გრამი)
+- optional comment
+
+Return JSON array like:
+[
+  {{
+    "customer": "...",
+    "product": "...",
+    "amount_value": "...",
+    "amount_unit": "...",
+    "comment": "..."
+  }},
+  ...
+]
+"""
+
+    try:
+        response = client_ai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ]
+        )
+        content = response.choices[0].message.content.strip()
+        return json.loads(content)
+    except Exception as e:
+        logging.error(f"OpenAI parsing failed: {e}")
         return None
 
-    customer_raw, product_raw, number, unit, comment = match.groups()
-    matched_customer = fuzzy_match(customer_raw, KNOWN_CUSTOMERS)
-    matched_product = fuzzy_match(product_raw, KNOWN_PRODUCTS)
-
-    return {
-        "type": "order",
-        "customer": matched_customer or customer_raw,
-        "product": matched_product or product_raw,
-        "amount_value": number,
-        "amount_unit": unit or "",
-        "comment": comment or "",
-        "raw_customer": customer_raw,
-        "raw_product": product_raw
-    }
-
-def update_google_sheet(data, author):
-    if data['type'] == 'order':
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sheet.append_row([
-            timestamp,
-            data['customer'],
-            data['product'],
-            data['amount_value'],
-            data['amount_unit'],
-            data['comment'],
-            author
-        ])
-
-# --- TELEGRAM ---
+# --- TELEGRAM HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome! Send me an order and I’ll log it to Google Sheets.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    message = update.message.text
     author = update.message.from_user.full_name or update.message.from_user.username or str(update.message.from_user.id)
-    lines = text.split('\n')
 
-    for line in lines:
-        for subline in re.split(r'[;,]', line):
-            subline = subline.strip()
-            if subline:
-                data = extract_data_from_line(subline)
-                if data:
-                    update_google_sheet(data, author)
-                    warn = ""
-                    if data['customer'] == data['raw_customer']:
-                        warn += " ⚠ უცნობი მომხმარებელი"
-                    if data['product'] == data['raw_product']:
-                        warn += " ⚠ უცნობი პროდუქტი"
-                    await update.message.reply_text(
-                        f"✅ Logged: {data['customer']} / {data['product']} / {data['amount_value']}{data['amount_unit']}{warn}"
-                    )
-                else:
-                    await update.message.reply_text(f"❌ Couldn't parse: {subline}")
+    # Extract customer before first dot
+    parts = re.split(r'\s*\.\s*', message, maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("❌ Message must start with customer name followed by '.'")
+        return
+
+    customer_guess = parts[0]
+
+    structured_data = call_openai_parser(message, customer_guess)
+
+    if not structured_data:
+        await update.message.reply_text("❌ GPT parsing failed.")
+        return
+
+    replies = []
+    for item in structured_data:
+        update_google_sheet_row(item, author)
+        replies.append(f"✅ {item['customer']} / {item['product']} / {item['amount_value']}{item['amount_unit']}")
+
+    await update.message.reply_text('\n'.join(replies))
 
 # --- MAIN ---
 
