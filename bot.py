@@ -73,29 +73,35 @@ def call_openai_parser(message, customer_input):
     shortlist = fuzzy_customer_candidates(customer_input, KNOWN_CUSTOMERS)
 
     system_prompt = f"""
-You are a helpful assistant that extracts structured order data from Georgian Telegram messages.
-Use this customer shortlist for matching: {', '.join(shortlist)}.
-Known product list: {', '.join(KNOWN_PRODUCTS)}.
+        You are a strict parser. Return ONLY valid JSON. No markdown, no explanation.
+        Match the customer to this shortlist: {', '.join(shortlist)}
+        Match products to this list: {', '.join(KNOWN_PRODUCTS)}
 
-Message may contain multiple products for the same customer. For each product, extract:
-- customer (one from shortlist or fallback to raw)
-- product (closest match from list or fallback)
-- amount value
-- amount unit (კგ, ც, ლ, გრამი)
-- optional comment
+        The user will send you a message like:
+        "ფუდსელი. 20კგ ხორცი, 5ც გრუდინკა"
 
-Return JSON array like:
-[
-  {{
-    "customer": "...",
-    "product": "...",
-    "amount_value": "...",
-    "amount_unit": "...",
-    "comment": "..."
-  }},
-  ...
-]
-"""
+        Your job is to extract structured product orders.
+        Return a JSON array like this (for multiple products):
+
+        [
+        {{
+            "customer": "შპს ფუდსელი",
+            "product": "ხორცი",
+            "amount_value": "20",
+            "amount_unit": "კგ",
+            "comment": ""
+        }},
+        {{
+            "customer": "შპს ფუდსელი",
+            "product": "გრუდინკა",
+            "amount_value": "5",
+            "amount_unit": "ც",
+            "comment": ""
+        }}
+        ]
+
+        Now parse the user message strictly and return valid JSON array only.
+        """
 
     try:
         response = client_ai.chat.completions.create(
@@ -106,10 +112,21 @@ Return JSON array like:
             ]
         )
         content = response.choices[0].message.content.strip()
+
+        # Log raw content for debugging
+        logging.info(f"OpenAI raw response:\n{content}")
+
+        # Attempt to extract JSON block using regex if needed
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+
         return json.loads(content)
+
     except Exception as e:
         logging.error(f"OpenAI parsing failed: {e}")
         return None
+
 
 # --- TELEGRAM HANDLERS ---
 
