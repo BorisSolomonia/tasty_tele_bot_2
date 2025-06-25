@@ -95,6 +95,9 @@ IMPORTANT! If you can't match, use raw values. Respond ONLY with a valid JSON ar
             )
             raw = response.choices[0].message.content.strip()
             logging.info(f"GPT raw response: {raw[:200]}...")
+# Strip code block if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
             return json.loads(raw)
 
         try:
