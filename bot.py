@@ -1,3 +1,4 @@
+# Re-executing the code after kernel reset
 import logging
 import os
 import re
@@ -26,149 +27,160 @@ SPREADSHEET_NAME = "Preseller Orders"
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# Load known customers and products
-def load_list(filename):
-    with open(filename, encoding='utf-8') as f:
-        return [line.strip() for line in f if line.strip()]
+# Known lists
+PRODUCTS_FILE = "known_products.txt"
+CUSTOMERS_FILE = "known_customers.txt"
 
-KNOWN_CUSTOMERS = load_list("known_customers.txt")
-KNOWN_PRODUCTS = load_list("known_products.txt")
+def load_list_from_file(file):
+    try:
+        with open(file, encoding='utf-8') as f:
+            return [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        logging.error(f"Failed to load {file}: {e}")
+        return []
 
-# --- GOOGLE SHEETS ---
+def append_to_file(file, item):
+    try:
+        with open(file, "a", encoding='utf-8') as f:
+            f.write(f"{item.strip()}\n")
+    except Exception as e:
+        logging.error(f"Failed to append to {file}: {e}")
+
+KNOWN_PRODUCTS = load_list_from_file(PRODUCTS_FILE)
+KNOWN_CUSTOMERS = load_list_from_file(CUSTOMERS_FILE)
+
+# Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
 sheet = gspread.authorize(creds).open(SPREADSHEET_NAME).sheet1
 
 # --- UTILS ---
-def fuzzy_match_customer(term, threshold=50):
-    return [match for match, score, _ in process.extract(term, KNOWN_CUSTOMERS) if score >= threshold]
-
-def fuzzy_match_product(term, threshold=50):
-    match, score, _ = process.extractOne(term, KNOWN_PRODUCTS)
-    return match if score >= threshold else None
 
 def sanitize(value):
-    return str(value).strip().replace('\n', ' ').replace('\r', '')
+    return str(value).strip().replace('\n', ' ').replace('\r', '').replace('\t', '')
+
+def fuzzy_match(term, known_list, threshold=50):
+    match, score, _ = process.extractOne(term, known_list)
+    return match if score >= threshold else None
+
+def get_shortlist(term, known_list):
+    return [entry for entry, score, _ in process.extract(term, known_list, limit=5) if score >= 50]
 
 def update_google_sheet(data, author):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sheet.append_row([
+    row = [
         sanitize(timestamp),
-        sanitize(data['customer']),
-        sanitize(data['product']),
-        sanitize(data['amount_value']),
-        sanitize(data['amount_unit']),
-        sanitize(data['comment']),
+        sanitize(data.get('customer', '')),
+        sanitize(data.get('product', '')),
+        sanitize(data.get('amount_value', '')),
+        sanitize(data.get('amount_unit', '')),
+        sanitize(data.get('comment', '')),
         sanitize(author)
-    ])
+    ]
+    sheet.append_row(row, value_input_option='USER_ENTERED')
+    logging.info(f"Logged to sheet: {row}")
 
-def parse_with_gpt(message_text, matched_customers):
-    customer_list = ", ".join(matched_customers[:5])  # shortlist
-    product_list = ", ".join(KNOWN_PRODUCTS)
+def call_gpt_fallback(raw_text, shortlist, known_products):
+    customer_list_str = ", ".join(shortlist)
+    product_list_str = ", ".join(known_products)
 
-    base_prompt = f"""
-    You are an assistant that parses Georgian order messages. As usual customer name is before dot.
-
-    Use this shortlist of customers: [{customer_list}]
-    Use this product list: [{product_list}]
-
-    Split the message into multiple structured JSON objects, one per product. Each object must look like this:
-    {{
-    "customer": "matched or raw customer",
-    "product": "matched or raw product",
-    "amount_value": "10",
+    system_prompt = f"""You are a helpful assistant that extracts structured order data from messages in Georgian. 
+You MUST only choose customers from this shortlist: {customer_list_str}
+and products from this list: {product_list_str}
+Format MUST be strict JSON array like:
+[
+  {{
+    "customer": "...",
+    "product": "...",
+    "amount_value": "...",
     "amount_unit": "კგ|ც|ლ|გრამი",
-    "comment": "optional"
-    }}
-
-IMPORTANT! If you can't match, use raw values. Respond ONLY with a valid JSON array!!!.
+    "comment": "..."
+  }},
+  ...
+]
+Return at least 'customer', 'product', 'amount_value', 'amount_unit'. If field is not available, leave empty string.
+Never use markdown like ```json.
 """
 
-    try:
-        def call_and_parse(prompt):
-            response = client_ai.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": prompt.strip()},
-                    {"role": "user", "content": message_text.strip()}
-                ]
-            )
-            raw = response.choices[0].message.content.strip()
-            logging.info(f"GPT raw response: {raw[:200]}...")
-# Strip code block if present
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-            return json.loads(raw)
+    user_prompt = f"Message: {raw_text}"
 
+    def try_parse(strict=False):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        if strict:
+            messages.insert(1, {"role": "system", "content": "Output JSON array only. No explanation. Strict format."})
+
+        response = client_ai.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+        content = response.choices[0].message.content.strip()
+        logging.info(f"GPT raw response: {content}")
         try:
-            return call_and_parse(base_prompt)
-        except json.JSONDecodeError:
-            logging.warning("GPT returned invalid JSON. Retrying with strict format request...")
+            parsed = json.loads(content)
+            for entry in parsed:
+                entry.setdefault("comment", "")
+                entry.setdefault("amount_unit", "")
+            return parsed
+        except Exception as e:
+            logging.warning(f"GPT returned invalid JSON. {'Second' if strict else 'First'} attempt failed.")
+            return None
 
-            strict_prompt = base_prompt + "\n\nReturn ONLY a valid JSON array. Do not include any other explanation or text."
-            try:
-                return call_and_parse(strict_prompt)
-            except json.JSONDecodeError:
-                logging.error("GPT second attempt also failed. Falling back to raw line.")
-                return [{
-                    "customer": message_text.split('.')[0].strip(),
-                    "product": "",
-                    "amount_value": "?",
-                    "amount_unit": "",
-                    "comment": ""
-                }]
+    parsed = try_parse(strict=False)
+    if not parsed:
+        parsed = try_parse(strict=True)
 
-    except Exception as e:
-        logging.error(f"OpenAI parsing failed: {e}")
-        return [{
-            "customer": message_text.split('.')[0].strip(),
-            "product": "",
-            "amount_value": "?",
-            "amount_unit": "",
-            "comment": ""
-        }]
+    return parsed
 
-# --- TELEGRAM HANDLERS ---
+# --- TELEGRAM ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 გამარჯობა! მომწერე შეკვეთა და ჩავწერ გუგლ ცხრილში.")
+    await update.message.reply_text("გამარჯობა! შეგიძლია მომწერო შეკვეთა, დავამუშავებ და Google Sheets-ში ჩავწერ.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    message = update.message.text.strip()
     author = update.message.from_user.full_name or update.message.from_user.username or str(update.message.from_user.id)
-    logging.info(f"Received message: {text} from {author}")
+    logging.info(f"Received message: {message} from {author}")
 
-    lines = text.split("\n")
-    for line in lines:
-        customer_match = re.match(r"^(.*?)\s*\.", line)
-        customer_input = customer_match.group(1).strip() if customer_match else ""
-        matched_customers = fuzzy_match_customer(customer_input)
+    customer_raw = message.split(".")[0].strip()
+    if customer_raw.lower().startswith("new"):
+        customer_raw_cleaned = customer_raw[3:].strip()
+        append_to_file(CUSTOMERS_FILE, customer_raw_cleaned)
+        KNOWN_CUSTOMERS.append(customer_raw_cleaned)
+        customer_raw = customer_raw_cleaned
 
-        logging.info(f"Customer input: '{customer_input}', matched shortlist: {matched_customers}")
+    shortlist = get_shortlist(customer_raw, KNOWN_CUSTOMERS)
+    logging.info(f"Customer input: '{customer_raw}', matched shortlist: {shortlist}")
 
-        entries = parse_with_gpt(line, matched_customers)
-        if not entries:
-            await update.message.reply_text("❌ ვერ დავამუშავე შეტყობინება.")
-            return
+    product_candidates = re.findall(r"(new\s*)?([ა-ჰ\s]+)\s+(\d+)\s*(კგ|ც|ლ|გრამი)?", message)
+    for p in product_candidates:
+        if p[0].lower().startswith("new"):
+            new_product = p[1].strip()
+            if new_product not in KNOWN_PRODUCTS:
+                append_to_file(PRODUCTS_FILE, new_product)
+                KNOWN_PRODUCTS.append(new_product)
 
-        for item in entries:
-            # fallback safety
-            item.setdefault("customer", customer_input)
-            item.setdefault("product", "")
-            item.setdefault("amount_value", "?")
-            item.setdefault("amount_unit", "")
-            item.setdefault("comment", "")
+    gpt_response = call_gpt_fallback(message, shortlist, KNOWN_PRODUCTS)
 
-            update_google_sheet(item, author)
+    if not gpt_response:
+        logging.error("GPT failed to return valid JSON twice.")
+        await update.message.reply_text("❌ ვერ დავამუშავე შეტყობინება.")
+        return
 
-            warn = ""
-            if item["customer"] not in KNOWN_CUSTOMERS:
-                warn += " ⚠ უცნობი მომხმარებელი"
-            if item["product"] not in KNOWN_PRODUCTS:
-                warn += " ⚠ უცნობი პროდუქტი"
+    count_logged = 0
+    for entry in gpt_response:
+        try:
+            update_google_sheet(entry, author)
+            count_logged += 1
+        except Exception as e:
+            logging.error(f"Failed to log entry: {entry}, Error: {e}")
 
-            await update.message.reply_text(
-                f"✅ {item['customer']} / {item['product']} / {item['amount_value']} {item['amount_unit']}{warn}"
-            )
+    if count_logged > 0:
+        await update.message.reply_text(f"✅ ჩავწერე {count_logged} პროდუქტ(ი) ცხრილში.")
+    else:
+        await update.message.reply_text("⚠ მონაცემები ვერ ჩაიწერა.")
 
 # --- MAIN ---
 def main():
