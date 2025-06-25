@@ -63,16 +63,22 @@ def build_shortlist(term, known_list, threshold=50, limit=5):
     matches = process.extract(term, known_list, scorer=fuzz.ratio)
     return [match for match, score, _ in matches if score >= threshold][:limit]
 
+# ... [everything before remains unchanged] ...
+
 def update_google_sheet(data, author):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def sanitize(value):
+        return str(value).strip().replace('\n', ' ').replace('\r', '').replace('\t', '')
+
     row = [
-        timestamp,
-        data['customer'],
-        data['product'],
-        data['amount_value'],
-        data['amount_unit'],
-        data['comment'],
-        author
+        sanitize(timestamp),
+        sanitize(data['customer']),
+        sanitize(data['product']),
+        sanitize(data['amount_value']),
+        sanitize(data['amount_unit']),
+        sanitize(data['comment']),
+        sanitize(author)
     ]
     sheet.append_row(row, value_input_option='USER_ENTERED')
     logging.info(f"Logged to sheet: {row}")
@@ -117,13 +123,14 @@ Message: \"{message}\"
             messages=messages
         )
         content = response.choices[0].message.content.strip()
+        content = content.strip().removeprefix("```json").removesuffix("```").strip()  # ✅ CLEANUP
         logging.info(f"GPT raw response: {content[:200]}...")
         return json.loads(content)
     except Exception as e1:
         logging.warning("GPT returned invalid JSON. Retrying with stricter format request...")
 
         strict_messages = [
-            {"role": "system", "content": "You are a precise JSON generator. Reply ONLY with strict valid JSON array, do not include any markdown, no ```json."},
+            {"role": "system", "content": "You are a precise JSON generator. Reply ONLY with valid JSON array, no markdown, no ```json."},
             {"role": "user", "content": base_prompt}
         ]
         try:
@@ -132,11 +139,13 @@ Message: \"{message}\"
                 messages=strict_messages
             )
             content = response.choices[0].message.content.strip()
+            content = content.strip().removeprefix("```json").removesuffix("```").strip()  # ✅ CLEANUP
             logging.info(f"GPT second raw response: {content[:200]}...")
             return json.loads(content)
         except Exception as e2:
             logging.error(f"GPT second attempt also failed: {e2}")
             return None
+
 
 def handle_new_items(data_list):
     for item in data_list:
