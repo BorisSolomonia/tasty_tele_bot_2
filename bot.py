@@ -63,59 +63,67 @@ def update_google_sheet(data, author):
     ])
 
 def parse_with_gpt(message_text, matched_customers):
-    customer_list = ", ".join(matched_customers[:5])  # up to 5 best matches
+    customer_list = ", ".join(matched_customers[:5])  # shortlist
     product_list = ", ".join(KNOWN_PRODUCTS)
 
-    system_prompt = f"""
-You are an assistant that parses Georgian order messages.
+    base_prompt = f"""
+    You are an assistant that parses Georgian order messages. As usual customer name is before dot.
 
-Use this shortlist of customers: [{customer_list}]
-Use this product list: [{product_list}]
+    Use this shortlist of customers: [{customer_list}]
+    Use this product list: [{product_list}]
 
-Parse the message into multiple JSON objects, one per product. Each object must follow this structure:
-{{
-  "customer": "matched or raw customer",
-  "product": "matched or raw product",
-  "amount_value": "10",
-  "amount_unit": "კგ|ც|ლ|გრამი",
-  "comment": "optional"
-}}
+    Split the message into multiple structured JSON objects, one per product. Each object must look like this:
+    {{
+    "customer": "matched or raw customer",
+    "product": "matched or raw product",
+    "amount_value": "10",
+    "amount_unit": "კგ|ც|ლ|გრამი",
+    "comment": "optional"
+    }}
 
-If matching fails, use the raw name for customer/product. Always return valid JSON array.
+IMPORTANT! If you can't match, use raw values. Respond ONLY with a valid JSON array!!!.
 """
 
-    logging.info("Sending message to GPT for parsing...")
     try:
-        response = client_ai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt.strip()},
-                {"role": "user", "content": message_text.strip()}
-            ]
-        )
-        content = response.choices[0].message.content.strip()
-
-        try:
-            parsed_data = json.loads(content)
-            if isinstance(parsed_data, dict):  # convert single item to list
-                parsed_data = [parsed_data]
-            return parsed_data
-        except json.JSONDecodeError:
-            logging.warning("GPT returned invalid JSON. Retrying with stricter format request...")
-
-            retry_prompt = system_prompt + "\n\nStrictly return a valid JSON array only. No comments or explanations."
+        def call_and_parse(prompt):
             response = client_ai.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": retry_prompt.strip()},
+                    {"role": "system", "content": prompt.strip()},
                     {"role": "user", "content": message_text.strip()}
                 ]
             )
-            retry_content = response.choices[0].message.content.strip()
-            return json.loads(retry_content)
+            raw = response.choices[0].message.content.strip()
+            logging.info(f"GPT raw response: {raw[:200]}...")
+            return json.loads(raw)
+
+        try:
+            return call_and_parse(base_prompt)
+        except json.JSONDecodeError:
+            logging.warning("GPT returned invalid JSON. Retrying with strict format request...")
+
+            strict_prompt = base_prompt + "\n\nReturn ONLY a valid JSON array. Do not include any other explanation or text."
+            try:
+                return call_and_parse(strict_prompt)
+            except json.JSONDecodeError:
+                logging.error("GPT second attempt also failed. Falling back to raw line.")
+                return [{
+                    "customer": message_text.split('.')[0].strip(),
+                    "product": "",
+                    "amount_value": "?",
+                    "amount_unit": "",
+                    "comment": ""
+                }]
+
     except Exception as e:
         logging.error(f"OpenAI parsing failed: {e}")
-        return []
+        return [{
+            "customer": message_text.split('.')[0].strip(),
+            "product": "",
+            "amount_value": "?",
+            "amount_unit": "",
+            "comment": ""
+        }]
 
 # --- TELEGRAM HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
