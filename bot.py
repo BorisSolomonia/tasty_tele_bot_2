@@ -178,7 +178,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Failed to log entry: {entry}, Error: {e}")
 
     if count_logged > 0:
-        await update.message.reply_text(f"✅ ჩავწერე {count_logged} პროდუქტ(ი) ცხრილში.")
+        await update.message.reply_text(f"✅ ჩავწერე {count_logged} პროდუქტ(ი) ცხრილში.{gpt_response}")
     else:
         await update.message.reply_text("⚠ მონაცემები ვერ ჩაიწერა.")
 
